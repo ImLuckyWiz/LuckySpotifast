@@ -1,8 +1,13 @@
-//! lucky_bridge.rs - Cliente WebSocket nativo para integración con herramientas y overlays externos.
+//! lucky_bridge.rs - Servidor HTTP REST y WebSocket integrado para control remoto y streaming.
 //!
-//! Se conecta a `ws://127.0.0.1:8765/spotifast` (o el valor de la variable de
-//! entorno `SPOTIFAST_HUB_URL`) y expone un protocolo JSON-RPC y eventos
-//! para control de reproducción, sincronización de cola y letras.
+//! 1. Servidor de control LAN (por defecto en `0.0.0.0:8766` o `SPOTIFAST_LISTEN_ADDR` / `SPOTIFAST_PORT`):
+//!    Permite a agentes y servicios en la red local (ej. Hermes) consultar estado, letras,
+//!    cola, buscar y reproducir música, saltar pistas, ajustar volumen, etc. tanto por HTTP
+//!    REST como por WebSocket bidireccional con eventos en tiempo real.
+//!
+//! 2. Cliente WebSocket saliente:
+//!    Se conecta automáticamente en segundo plano a `ws://127.0.0.1:8765/spotifast`
+//!    (o `SPOTIFAST_WS_URL` / `SPOTIFAST_HUB_URL`) para sincronizar con herramientas de streaming.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,10 +17,10 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Representación simplificada de una canción para el bridge WebSocket.
+/// Representación simplificada de una canción para el bridge y la API REST/WS.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimplifiedTrack {
@@ -130,10 +135,24 @@ pub enum UiCommand {
     Skip {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    Previous {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Play {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    PlayUri {
+        uri: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Pause {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    TogglePlay {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    Seek {
+        position_ms: u32,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     GetVolume {
@@ -143,14 +162,32 @@ pub enum UiCommand {
         volume: f64,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    ClearQueue {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    GetNowPlaying {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    GetQueue {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
-/// Eventos salientes desde Spotifast hacia el hub WebSocket.
+/// Eventos salientes desde Spotifast hacia los clientes WebSocket.
+#[derive(Clone, Debug)]
 pub enum BridgeEvent {
     Track(Value),
     Progress(Value),
     Lyrics(Value),
     Log(String),
+}
+
+/// Estado en memoria compartido para respuestas rápidas de la API.
+#[derive(Default, Clone, Debug)]
+pub struct BridgeState {
+    pub last_track: Option<Value>,
+    pub last_progress: Option<Value>,
+    pub last_lyrics: Option<Value>,
 }
 
 /// Handle mantenido por App para interactuar con la tarea de WebSocket en segundo plano.
@@ -175,7 +212,7 @@ impl AppBridgeHandle {
         cmds
     }
 
-    /// Envía un evento hacia el hub WebSocket.
+    /// Envía un evento hacia el hub y los clientes conectados.
     pub fn send_event(&self, event: BridgeEvent) {
         let _ = self.event_tx.send(event);
     }
@@ -372,18 +409,28 @@ pub async fn execute_catalog_search(
     }
 }
 
-// ---------- Loop de conexión WebSocket ----------
+// ---------- Inicialización del Bridge ----------
 
-/// Inicia el cliente WebSocket en segundo plano dentro del runtime Tokio.
+/// Inicia las tareas del bridge dentro del runtime Tokio dedicado.
 pub fn start(
     waker: fastframe_shell::Waker,
     backend_sender: mpsc::UnboundedSender<crate::backend::Command>,
 ) -> AppBridgeHandle {
     let (ui_cmd_tx, ui_cmd_rx) = std_mpsc::channel::<UiCommand>();
-    let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
     let connect_generation = Arc::new(AtomicU64::new(0));
 
     let gen_clone = Arc::clone(&connect_generation);
+    let state = Arc::new(RwLock::new(BridgeState::default()));
+    let (server_broadcast_tx, _) = broadcast::channel::<String>(128);
+    let (hub_event_tx, hub_event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+
+    let waker_clone = waker.clone();
+    let backend_clone = backend_sender.clone();
+    let ui_cmd_clone = ui_cmd_tx.clone();
+    let state_clone = Arc::clone(&state);
+    let bcast_clone = server_broadcast_tx.clone();
+
     if let Err(err) = std::thread::Builder::new()
         .name("spotifast-bridge".to_string())
         .spawn(move || {
@@ -392,11 +439,76 @@ pub fn start(
                 .build()
             {
                 Ok(rt) => {
+                    // Tarea 1: Enrutador de eventos y caché en memoria
+                    let state_disp = Arc::clone(&state_clone);
+                    let bcast_disp = bcast_clone.clone();
+                    rt.spawn(async move {
+                        while let Some(event) = event_rx.recv().await {
+                            let (json_str, is_track, is_prog, is_lyr) = match &event {
+                                BridgeEvent::Track(data) => (
+                                    serde_json::json!({ "event": "track", "data": data }).to_string(),
+                                    Some(data.clone()),
+                                    None,
+                                    None,
+                                ),
+                                BridgeEvent::Progress(data) => (
+                                    serde_json::json!({ "event": "progress", "data": data }).to_string(),
+                                    None,
+                                    Some(data.clone()),
+                                    None,
+                                ),
+                                BridgeEvent::Lyrics(data) => (
+                                    serde_json::json!({ "event": "lyrics", "data": data }).to_string(),
+                                    None,
+                                    None,
+                                    Some(data.clone()),
+                                ),
+                                BridgeEvent::Log(data) => (
+                                    serde_json::json!({ "event": "log", "data": data }).to_string(),
+                                    None,
+                                    None,
+                                    None,
+                                ),
+                            };
+
+                            // Actualiza estado en memoria
+                            if is_track.is_some() || is_prog.is_some() || is_lyr.is_some() {
+                                let mut s = state_disp.write().await;
+                                if let Some(t) = is_track {
+                                    s.last_track = Some(t);
+                                }
+                                if let Some(p) = is_prog {
+                                    s.last_progress = Some(p);
+                                }
+                                if let Some(l) = is_lyr {
+                                    s.last_lyrics = Some(l);
+                                }
+                            }
+
+                            // Transmite a clientes conectados al servidor LAN
+                            let _ = bcast_disp.send(json_str);
+
+                            // Reenvía al cliente saliente de streaming
+                            let _ = hub_event_tx.send(event);
+                        }
+                    });
+
+                    // Tarea 2: Servidor LAN HTTP REST + WebSocket
+                    let srv_backend = backend_clone.clone();
+                    let srv_uicmd = ui_cmd_clone.clone();
+                    let srv_waker = waker_clone.clone();
+                    let srv_state = Arc::clone(&state_clone);
+                    let srv_bcast = bcast_clone.clone();
+                    rt.spawn(async move {
+                        run_server(srv_state, srv_bcast, srv_backend, srv_uicmd, srv_waker).await;
+                    });
+
+                    // Tarea 3: Cliente saliente de streaming
                     rt.block_on(run_client(
-                        waker,
-                        backend_sender,
-                        ui_cmd_tx,
-                        event_rx,
+                        waker_clone,
+                        backend_clone,
+                        ui_cmd_clone,
+                        hub_event_rx,
                         gen_clone,
                     ));
                 }
@@ -416,6 +528,606 @@ pub fn start(
     }
 }
 
+// ---------- Servidor LAN HTTP REST + WebSocket ----------
+
+async fn run_server(
+    state: Arc<RwLock<BridgeState>>,
+    broadcast_tx: broadcast::Sender<String>,
+    backend_sender: mpsc::UnboundedSender<crate::backend::Command>,
+    ui_cmd_tx: std_mpsc::Sender<UiCommand>,
+    waker: fastframe_shell::Waker,
+) {
+    let listen_addr = std::env::var("SPOTIFAST_LISTEN_ADDR").unwrap_or_else(|_| {
+        let port = std::env::var("SPOTIFAST_PORT").unwrap_or_else(|_| "8766".to_string());
+        format!("0.0.0.0:{port}")
+    });
+
+    let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
+        Ok(l) => {
+            log::info!("[lucky_bridge] Servidor HTTP/WS iniciado en http://{listen_addr}");
+            l
+        }
+        Err(e) => {
+            log::warn!("[lucky_bridge] No se pudo iniciar el servidor en {listen_addr}: {e}");
+            return;
+        }
+    };
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let s_state = Arc::clone(&state);
+                let s_bcast = broadcast_tx.clone();
+                let s_backend = backend_sender.clone();
+                let s_uicmd = ui_cmd_tx.clone();
+                let s_waker = waker.clone();
+                tokio::spawn(async move {
+                    handle_incoming_connection(stream, s_bcast, s_state, s_backend, s_uicmd, s_waker).await;
+                });
+            }
+            Err(e) => {
+                log::debug!("[lucky_bridge] Error aceptando conexion: {e}");
+            }
+        }
+    }
+}
+
+async fn handle_incoming_connection(
+    stream: tokio::net::TcpStream,
+    broadcast_tx: broadcast::Sender<String>,
+    state: Arc<RwLock<BridgeState>>,
+    backend_sender: mpsc::UnboundedSender<crate::backend::Command>,
+    ui_cmd_tx: std_mpsc::Sender<UiCommand>,
+    waker: fastframe_shell::Waker,
+) {
+    let mut buf = [0u8; 1024];
+    let n = match stream.peek(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    let peeked = String::from_utf8_lossy(&buf[..n]);
+
+    if peeked.to_ascii_lowercase().contains("upgrade: websocket") {
+        match tokio_tungstenite::accept_async(stream).await {
+            Ok(ws_stream) => {
+                handle_server_websocket(ws_stream, broadcast_tx, backend_sender, ui_cmd_tx, waker).await;
+            }
+            Err(e) => {
+                log::debug!("[lucky_bridge] Error en handshake WebSocket: {e}");
+            }
+        }
+    } else {
+        handle_http_connection(stream, state, backend_sender, ui_cmd_tx, waker).await;
+    }
+}
+
+async fn handle_server_websocket(
+    ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    broadcast_tx: broadcast::Sender<String>,
+    backend_sender: mpsc::UnboundedSender<crate::backend::Command>,
+    ui_cmd_tx: std_mpsc::Sender<UiCommand>,
+    waker: fastframe_shell::Waker,
+) {
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+    let mut bcast_rx = broadcast_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            res = bcast_rx.recv() => {
+                match res {
+                    Ok(msg) => {
+                        if ws_write.send(Message::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            msg_opt = ws_read.next() => {
+                let Some(msg_res) = msg_opt else { break };
+                match msg_res {
+                    Ok(Message::Text(text)) => {
+                        handle_rpc_message(&text, &mut ws_write, &backend_sender, &ui_cmd_tx, &waker).await;
+                    }
+                    Ok(Message::Ping(_)) => {
+                        let _ = ws_write.flush().await;
+                    }
+                    Ok(Message::Close(_)) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn handle_http_connection(
+    mut stream: tokio::net::TcpStream,
+    state: Arc<RwLock<BridgeState>>,
+    backend_sender: mpsc::UnboundedSender<crate::backend::Command>,
+    ui_cmd_tx: std_mpsc::Sender<UiCommand>,
+    waker: fastframe_shell::Waker,
+) {
+    let Some((method, full_path, _headers, body_json)) = read_http_request(&mut stream).await else {
+        return;
+    };
+
+    if method == "OPTIONS" {
+        send_http_cors_preflight(&mut stream).await;
+        return;
+    }
+
+    let (path, query_str) = split_path_query(&full_path);
+
+    match (method.as_str(), path) {
+        ("GET", "/") | ("GET", "/api") | ("GET", "/api/help") | ("GET", "/api/status") => {
+            let info = serde_json::json!({
+                "app": "Spotifast",
+                "status": "running",
+                "endpoints": [
+                    "GET    /api/now",
+                    "GET    /api/lyrics",
+                    "GET    /api/queue",
+                    "GET    /api/queue/uris",
+                    "GET    /api/search?q=...&limit=...",
+                    "POST   /api/play (json: { uri?: string, query?: string })",
+                    "POST   /api/pause",
+                    "POST   /api/toggle",
+                    "POST   /api/next",
+                    "POST   /api/previous",
+                    "POST   /api/seek (json: { positionMs: number })",
+                    "GET    /api/volume",
+                    "POST   /api/volume (json: { volume: 0.0-1.0 })",
+                    "POST   /api/queue (json: { uri?: string, query?: string })",
+                    "POST   /api/dequeue (json: { uri: string })",
+                    "POST   /api/clear"
+                ]
+            });
+            send_http_json(&mut stream, 200, "OK", &info).await;
+        }
+
+        ("GET", "/api/now") | ("GET", "/api/current") => {
+            let live = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::GetNowPlaying { reply }).await;
+            match live {
+                Ok(val) if !val.is_null() => {
+                    send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "track": val })).await;
+                }
+                _ => {
+                    let cached = state.read().await.last_track.clone();
+                    send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "track": cached })).await;
+                }
+            }
+        }
+
+        ("GET", "/api/lyrics") => {
+            let lyrics = state.read().await.last_lyrics.clone();
+            send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "lyrics": lyrics })).await;
+        }
+
+        ("GET", "/api/queue") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::GetQueue { reply }).await;
+            match res {
+                Ok(q) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "queue": q })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("GET", "/api/queue/uris") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::QueueUris { reply }).await;
+            match res {
+                Ok(uris) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "uris": uris })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("GET", "/api/search") | ("POST", "/api/search") => {
+            let q_param = parse_query_param(query_str, "q")
+                .or_else(|| parse_query_param(query_str, "query"));
+            let q_body = body_json.as_ref().and_then(|b| b.get("query").or_else(|| b.get("q"))).and_then(|v| v.as_str());
+            let query = q_param.as_deref().or(q_body).unwrap_or_default().trim().to_string();
+
+            if query.is_empty() {
+                send_http_json(&mut stream, 400, "Bad Request", &serde_json::json!({ "ok": false, "error": "Parámetro 'q' o 'query' requerido" })).await;
+                return;
+            }
+
+            let limit = parse_query_param(query_str, "limit")
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| body_json.as_ref().and_then(|b| b.get("limit")).and_then(|v| v.as_u64()).map(|n| n as usize))
+                .unwrap_or(5)
+                .clamp(1, 20);
+
+            match resolve_search(&backend_sender, query, Some(limit)).await {
+                Ok(tracks) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "tracks": tracks })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/play") | ("GET", "/api/play") => {
+            let uri_param = parse_query_param(query_str, "uri");
+            let uri_body = body_json.as_ref().and_then(|b| b.get("uri")).and_then(|v| v.as_str());
+            let uri = uri_param.as_deref().or(uri_body).map(|s| s.to_string());
+
+            let q_param = parse_query_param(query_str, "q").or_else(|| parse_query_param(query_str, "query"));
+            let q_body = body_json.as_ref().and_then(|b| b.get("query").or_else(|| b.get("q"))).and_then(|v| v.as_str());
+            let query = q_param.as_deref().or(q_body).map(|s| s.to_string());
+
+            if let Some(track_uri) = uri {
+                let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::PlayUri { uri: track_uri.clone(), reply }).await;
+                match res {
+                    Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "played": track_uri })).await,
+                    Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+                }
+            } else if let Some(q) = query {
+                match resolve_search(&backend_sender, q, None).await {
+                    Ok(tracks) if !tracks.is_empty() => {
+                        let top = &tracks[0];
+                        let _ = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::PlayUri { uri: top.uri.clone(), reply }).await;
+                        send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "played": top })).await;
+                    }
+                    Ok(_) => {
+                        send_http_json(&mut stream, 404, "Not Found", &serde_json::json!({ "ok": false, "error": "No se encontraron resultados" })).await;
+                    }
+                    Err(e) => {
+                        send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await;
+                    }
+                }
+            } else {
+                let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Play { reply }).await;
+                match res {
+                    Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "resumed": true })).await,
+                    Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+                }
+            }
+        }
+
+        ("POST", "/api/pause") | ("GET", "/api/pause") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Pause { reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "paused": true })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/toggle") | ("POST", "/api/playpause") | ("GET", "/api/toggle") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::TogglePlay { reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "toggled": true })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/next") | ("POST", "/api/skip") | ("GET", "/api/next") | ("GET", "/api/skip") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Skip { reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "skipped": true })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/previous") | ("POST", "/api/prev") | ("GET", "/api/previous") | ("GET", "/api/prev") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Previous { reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "previous": true })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/seek") | ("GET", "/api/seek") => {
+            let pos = parse_query_param(query_str, "ms")
+                .or_else(|| parse_query_param(query_str, "positionMs"))
+                .or_else(|| parse_query_param(query_str, "pos"))
+                .and_then(|s| s.parse::<u32>().ok())
+                .or_else(|| {
+                    body_json
+                        .as_ref()
+                        .and_then(|b| b.get("positionMs").or_else(|| b.get("position_ms")).or_else(|| b.get("ms")))
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32)
+                })
+                .unwrap_or(0);
+
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Seek { position_ms: pos, reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "positionMs": pos })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("GET", "/api/volume") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::GetVolume { reply }).await;
+            match res {
+                Ok(v) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "volume": v })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/volume") => {
+            let vol = parse_query_param(query_str, "volume")
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| parse_query_param(query_str, "percent").and_then(|s| s.parse::<f64>().ok()).map(|p| p / 100.0))
+                .or_else(|| {
+                    body_json.as_ref().and_then(|b| {
+                        b.get("volume")
+                            .and_then(|v| v.as_f64())
+                            .or_else(|| b.get("percent").and_then(|v| v.as_f64()).map(|p| p / 100.0))
+                    })
+                })
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::SetVolume { volume: vol, reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "volume": vol })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/queue") => {
+            let uri_param = parse_query_param(query_str, "uri");
+            let uri_body = body_json.as_ref().and_then(|b| b.get("uri")).and_then(|v| v.as_str());
+            let uri = uri_param.as_deref().or(uri_body).map(|s| s.to_string());
+
+            let q_param = parse_query_param(query_str, "q").or_else(|| parse_query_param(query_str, "query"));
+            let q_body = body_json.as_ref().and_then(|b| b.get("query").or_else(|| b.get("q"))).and_then(|v| v.as_str());
+            let query = q_param.as_deref().or(q_body).map(|s| s.to_string());
+
+            if let Some(track_uri) = uri {
+                let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Enqueue { uri: track_uri.clone(), reply }).await;
+                match res {
+                    Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "queued": track_uri })).await,
+                    Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+                }
+            } else if let Some(q) = query {
+                match resolve_search(&backend_sender, q, None).await {
+                    Ok(tracks) if !tracks.is_empty() => {
+                        let top = &tracks[0];
+                        let _ = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Enqueue { uri: top.uri.clone(), reply }).await;
+                        send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "queued": top })).await;
+                    }
+                    Ok(_) => {
+                        send_http_json(&mut stream, 404, "Not Found", &serde_json::json!({ "ok": false, "error": "No se encontraron resultados" })).await;
+                    }
+                    Err(e) => {
+                        send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+                    }
+                }
+            } else {
+                send_http_json(&mut stream, 400, "Bad Request", &serde_json::json!({ "ok": false, "error": "Parámetro 'uri' o 'query' requerido" })).await;
+            }
+        }
+
+        ("POST", "/api/dequeue") | ("DELETE", "/api/queue") => {
+            let uri_param = parse_query_param(query_str, "uri");
+            let uri_body = body_json.as_ref().and_then(|b| b.get("uri")).and_then(|v| v.as_str());
+            let uri = uri_param.as_deref().or(uri_body).unwrap_or_default().to_string();
+
+            if uri.is_empty() {
+                send_http_json(&mut stream, 400, "Bad Request", &serde_json::json!({ "ok": false, "error": "Parámetro 'uri' requerido" })).await;
+                return;
+            }
+
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::Dequeue { uri: uri.clone(), reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "dequeued": uri })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        ("POST", "/api/clear") | ("DELETE", "/api/queue/all") => {
+            let res = send_ui_cmd(&ui_cmd_tx, &waker, |reply| UiCommand::ClearQueue { reply }).await;
+            match res {
+                Ok(_) => send_http_json(&mut stream, 200, "OK", &serde_json::json!({ "ok": true, "cleared": true })).await,
+                Err(e) => send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+            }
+        }
+
+        _ => {
+            send_http_json(
+                &mut stream,
+                404,
+                "Not Found",
+                &serde_json::json!({ "ok": false, "error": format!("Ruta desconocida: {method} {path}") }),
+            )
+            .await;
+        }
+    }
+}
+
+// ---------- Helpers HTTP ----------
+
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<(String, String, String, Option<Value>)> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(4096);
+    let mut temp = [0u8; 2048];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+
+    loop {
+        let n = stream.read(&mut temp).await.ok()?;
+        if n == 0 {
+            if buf.is_empty() {
+                return None;
+            }
+            break;
+        }
+        buf.extend_from_slice(&temp[..n]);
+
+        if header_end.is_none() {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+            } else if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                header_end = Some(pos + 2);
+            }
+            if let Some(pos) = header_end {
+                let head_str = String::from_utf8_lossy(&buf[..pos]);
+                for line in head_str.lines() {
+                    if let Some(val) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = val.trim().parse::<usize>().unwrap_or(0);
+                    }
+                }
+            }
+        }
+
+        if let Some(pos) = header_end {
+            if buf.len() >= pos + content_length {
+                break;
+            }
+        }
+        if buf.len() > 65536 {
+            break;
+        }
+    }
+
+    let end_headers = header_end.unwrap_or(buf.len());
+    let head_str = String::from_utf8_lossy(&buf[..end_headers]).to_string();
+    let mut lines = head_str.lines();
+    let req_line = lines.next()?;
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next()?.to_ascii_uppercase();
+    let full_path = parts.next()?.to_string();
+
+    let body_bytes = if end_headers < buf.len() {
+        &buf[end_headers..]
+    } else {
+        &[]
+    };
+    let body_json = if !body_bytes.is_empty() {
+        serde_json::from_slice::<Value>(body_bytes).ok()
+    } else {
+        None
+    };
+
+    Some((method, full_path, head_str, body_json))
+}
+
+fn split_path_query(full: &str) -> (&str, &str) {
+    if let Some(idx) = full.find('?') {
+        (&full[..idx], &full[idx + 1..])
+    } else {
+        (full, "")
+    }
+}
+
+fn parse_query_param(query_str: &str, key: &str) -> Option<String> {
+    for pair in query_str.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let k = kv.next()?;
+        let v = kv.next().unwrap_or("");
+        if k == key {
+            return Some(url_decode(v));
+        }
+    }
+    None
+}
+
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(val) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(val as char);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+async fn send_http_json(stream: &mut tokio::net::TcpStream, status: u16, reason: &str, body: &Value) {
+    use tokio::io::AsyncWriteExt;
+    let json_bytes = serde_json::to_vec(body).unwrap_or_default();
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Connection: close\r\n\r\n",
+        json_bytes.len()
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.write_all(&json_bytes).await;
+    let _ = stream.flush().await;
+}
+
+async fn send_http_cors_preflight(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let resp = "HTTP/1.1 204 No Content\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Connection: close\r\n\r\n";
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+async fn send_ui_cmd(
+    ui_cmd_tx: &std_mpsc::Sender<UiCommand>,
+    waker: &fastframe_shell::Waker,
+    cmd_ctor: impl FnOnce(oneshot::Sender<Result<Value, String>>) -> UiCommand,
+) -> Result<Value, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = cmd_ctor(reply_tx);
+    if ui_cmd_tx.send(cmd).is_err() {
+        return Err("Canal de UI cerrado".into());
+    }
+    waker.wake();
+    match reply_rx.await {
+        Ok(Ok(val)) => Ok(val),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err("UI no respondió".into()),
+    }
+}
+
+async fn resolve_search(
+    backend_sender: &mpsc::UnboundedSender<crate::backend::Command>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<SimplifiedTrack>, String> {
+    if let Some(uri) = extract_uri(&query) {
+        let id = uri.split(':').last().unwrap_or(&uri).to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = backend_sender.send(crate::backend::Command::LuckyBridge(
+            CatalogRequest::TrackByUri { id, reply: reply_tx },
+        ));
+        match reply_rx.await {
+            Ok(Ok(track)) => Ok(vec![track]),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err("Backend desconectado".into()),
+        }
+    } else {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = backend_sender.send(crate::backend::Command::LuckyBridge(
+            CatalogRequest::SearchTracks {
+                query,
+                limit,
+                reply: reply_tx,
+            },
+        ));
+        match reply_rx.await {
+            Ok(Ok(tracks)) => Ok(tracks),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err("Backend desconectado".into()),
+        }
+    }
+}
+
+// ---------- Loop de cliente WebSocket saliente (Streaming) ----------
+
 async fn run_client(
     waker: fastframe_shell::Waker,
     backend_sender: mpsc::UnboundedSender<crate::backend::Command>,
@@ -432,7 +1144,7 @@ async fn run_client(
         log::debug!("[lucky_bridge] Conectando a {hub_url}...");
         match tokio_tungstenite::connect_async(&hub_url).await {
             Ok((ws_stream, _)) => {
-                log::info!("[lucky_bridge] Conectado exitosamente al hub WebSocket");
+                log::info!("[lucky_bridge] Conectado exitosamente al hub de streaming");
                 retry_ms = 3000;
                 connect_generation.fetch_add(1, Ordering::SeqCst);
                 waker.wake();
@@ -552,68 +1264,17 @@ async fn handle_rpc_message<S>(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            if let Some(uri) = extract_uri(&query) {
-                let id = uri.split(':').last().unwrap_or(&uri).to_string();
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = backend_sender.send(crate::backend::Command::LuckyBridge(
-                    CatalogRequest::TrackByUri { id, reply: reply_tx },
-                ));
-                match reply_rx.await {
-                    Ok(Ok(track)) => {
-                        send_rpc_response(
-                            write,
-                            id_val,
-                            true,
-                            Some(serde_json::to_value(track).unwrap()),
-                            None,
-                        )
-                        .await;
-                    }
-                    Ok(Err(err)) => {
-                        send_rpc_response(write, id_val, false, None, Some(err)).await;
-                    }
-                    Err(_) => {
-                        send_rpc_response(
-                            write,
-                            id_val,
-                            false,
-                            None,
-                            Some("Backend desconectado".into()),
-                        )
-                        .await;
-                    }
+            match resolve_search(backend_sender, query, None).await {
+                Ok(mut tracks) => {
+                    let data = if tracks.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::to_value(tracks.remove(0)).unwrap_or(Value::Null)
+                    };
+                    send_rpc_response(write, id_val, true, Some(data), None).await;
                 }
-            } else {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = backend_sender.send(crate::backend::Command::LuckyBridge(
-                    CatalogRequest::SearchTracks {
-                        query,
-                        limit: None,
-                        reply: reply_tx,
-                    },
-                ));
-                match reply_rx.await {
-                    Ok(Ok(mut tracks)) => {
-                        let data = if tracks.is_empty() {
-                            Value::Null
-                        } else {
-                            serde_json::to_value(tracks.remove(0)).unwrap()
-                        };
-                        send_rpc_response(write, id_val, true, Some(data), None).await;
-                    }
-                    Ok(Err(err)) => {
-                        send_rpc_response(write, id_val, false, None, Some(err)).await;
-                    }
-                    Err(_) => {
-                        send_rpc_response(
-                            write,
-                            id_val,
-                            false,
-                            None,
-                            Some("Backend desconectado".into()),
-                        )
-                        .await;
-                    }
+                Err(err) => {
+                    send_rpc_response(write, id_val, false, None, Some(err)).await;
                 }
             }
         }
@@ -628,38 +1289,20 @@ async fn handle_rpc_message<S>(
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(5)
-                .clamp(1, 8);
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = backend_sender.send(crate::backend::Command::LuckyBridge(
-                CatalogRequest::SearchTracks {
-                    query,
-                    limit: Some(limit),
-                    reply: reply_tx,
-                },
-            ));
-            match reply_rx.await {
-                Ok(Ok(tracks)) => {
+                .clamp(1, 20);
+            match resolve_search(backend_sender, query, Some(limit)).await {
+                Ok(tracks) => {
                     send_rpc_response(
                         write,
                         id_val,
                         true,
-                        Some(serde_json::to_value(tracks).unwrap()),
+                        Some(serde_json::to_value(tracks).unwrap_or(Value::Null)),
                         None,
                     )
                     .await;
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     send_rpc_response(write, id_val, false, None, Some(err)).await;
-                }
-                Err(_) => {
-                    send_rpc_response(
-                        write,
-                        id_val,
-                        false,
-                        None,
-                        Some("Backend desconectado".into()),
-                    )
-                    .await;
                 }
             }
         }
@@ -700,19 +1343,10 @@ async fn handle_rpc_message<S>(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::Enqueue {
-                uri,
-                reply: reply_tx,
-            });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::Enqueue { uri, reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         "dequeue" => {
@@ -721,101 +1355,106 @@ async fn handle_rpc_message<S>(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::Dequeue {
-                uri,
-                reply: reply_tx,
-            });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::Dequeue { uri, reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         "queueUris" => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::QueueUris { reply: reply_tx });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::QueueUris { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         "skip" => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::Skip { reply: reply_tx });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::Skip { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
+            }
+        }
+        "previous" => {
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::Previous { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         "play" => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::Play { reply: reply_tx });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let uri_opt = req.get("uri").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let res = if let Some(uri) = uri_opt {
+                send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::PlayUri { uri, reply }).await
+            } else {
+                send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::Play { reply }).await
+            };
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         "pause" => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::Pause { reply: reply_tx });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::Pause { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
+            }
+        }
+        "togglePlay" | "playPause" => {
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::TogglePlay { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
+            }
+        }
+        "seek" => {
+            let pos = req
+                .get("positionMs")
+                .or_else(|| req.get("position_ms"))
+                .or_else(|| req.get("ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::Seek { position_ms: pos, reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         "getVolume" => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::GetVolume { reply: reply_tx });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::GetVolume { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         "setVolume" => {
             let vol = req.get("volume").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ui_cmd_tx.send(UiCommand::SetVolume {
-                volume: vol,
-                reply: reply_tx,
-            });
-            waker.wake();
-            match reply_rx.await {
-                Ok(Ok(val)) => send_rpc_response(write, id_val, true, Some(val), None).await,
-                Ok(Err(err)) => send_rpc_response(write, id_val, false, None, Some(err)).await,
-                Err(_) => {
-                    send_rpc_response(write, id_val, false, None, Some("UI no respondió".into()))
-                        .await
-                }
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::SetVolume { volume: vol, reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
+            }
+        }
+        "clearQueue" => {
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::ClearQueue { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
+            }
+        }
+        "nowPlaying" => {
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::GetNowPlaying { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
+            }
+        }
+        "getQueue" => {
+            let res = send_ui_cmd(ui_cmd_tx, waker, |reply| UiCommand::GetQueue { reply }).await;
+            match res {
+                Ok(val) => send_rpc_response(write, id_val, true, Some(val), None).await,
+                Err(err) => send_rpc_response(write, id_val, false, None, Some(err)).await,
             }
         }
         unknown => {

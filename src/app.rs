@@ -5829,6 +5829,10 @@ impl App {
                     self.actions.push(Action::Next);
                     let _ = reply.send(Ok(serde_json::Value::Bool(true)));
                 }
+                crate::lucky_bridge::UiCommand::Previous { reply } => {
+                    self.actions.push(Action::Previous);
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
                 crate::lucky_bridge::UiCommand::Play { reply } => {
                     let playing = self.now_playing().is_some_and(|now| now.playing);
                     if !playing {
@@ -5836,11 +5840,23 @@ impl App {
                     }
                     let _ = reply.send(Ok(serde_json::Value::Bool(true)));
                 }
+                crate::lucky_bridge::UiCommand::PlayUri { uri, reply } => {
+                    self.actions.push(Action::PlayUris { uris: vec![uri], index: 0 });
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
                 crate::lucky_bridge::UiCommand::Pause { reply } => {
                     let playing = self.now_playing().is_some_and(|now| now.playing);
                     if playing {
                         self.actions.push(Action::TogglePlay);
                     }
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::TogglePlay { reply } => {
+                    self.actions.push(Action::TogglePlay);
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::Seek { position_ms, reply } => {
+                    self.actions.push(Action::Seek(position_ms));
                     let _ = reply.send(Ok(serde_json::Value::Bool(true)));
                 }
                 crate::lucky_bridge::UiCommand::SetVolume { volume, reply } => {
@@ -5854,6 +5870,53 @@ impl App {
                         .map(|now| now.volume_percent)
                         .unwrap_or_else(|| volume_to_percent(self.settings.volume));
                     let _ = reply.send(Ok(serde_json::to_value(vol as f64 / 100.0).unwrap_or(serde_json::Value::Null)));
+                }
+                crate::lucky_bridge::UiCommand::ClearQueue { reply } => {
+                    self.manual_queue.clear();
+                    self.resync_local_queue();
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::GetNowPlaying { reply } => {
+                    let val = if let Some(now) = self.now_playing() {
+                        let artists = now
+                            .artists
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        serde_json::json!({
+                            "uri": now.uri,
+                            "name": now.title,
+                            "artists": artists,
+                            "cover": now.art_url,
+                            "durationMs": now.duration_ms,
+                            "positionMs": now.position_ms,
+                            "paused": !now.playing,
+                            "volumePercent": now.volume_percent,
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    let _ = reply.send(Ok(val));
+                }
+                crate::lucky_bridge::UiCommand::GetQueue { reply } => {
+                    let mut items = Vec::new();
+                    if let Loadable::Loaded(queue) = &self.queue {
+                        for item in &queue.queue {
+                            items.push(serde_json::json!({
+                                "uri": item.uri(),
+                                "name": item.name(),
+                                "artists": item.artist_names(),
+                            }));
+                        }
+                    } else {
+                        for uri in &self.manual_queue {
+                            items.push(serde_json::json!({
+                                "uri": uri,
+                            }));
+                        }
+                    }
+                    let _ = reply.send(Ok(serde_json::to_value(items).unwrap_or(serde_json::Value::Null)));
                 }
             }
         }
