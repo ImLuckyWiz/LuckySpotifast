@@ -384,9 +384,30 @@ pub fn start(
     let connect_generation = Arc::new(AtomicU64::new(0));
 
     let gen_clone = Arc::clone(&connect_generation);
-    tokio::spawn(async move {
-        run_client(waker, backend_sender, ui_cmd_tx, event_rx, gen_clone).await;
-    });
+    if let Err(err) = std::thread::Builder::new()
+        .name("spotifast-bridge".to_string())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => {
+                    rt.block_on(run_client(
+                        waker,
+                        backend_sender,
+                        ui_cmd_tx,
+                        event_rx,
+                        gen_clone,
+                    ));
+                }
+                Err(err) => {
+                    log::error!("Failed to create Tokio runtime for bridge: {err}");
+                }
+            }
+        })
+    {
+        log::error!("Failed to spawn bridge thread: {err}");
+    }
 
     AppBridgeHandle {
         ui_cmd_rx,
