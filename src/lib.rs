@@ -26,6 +26,7 @@ pub mod liked;
 pub mod limiter;
 pub mod link;
 pub mod local_tags;
+pub mod lucky_bridge;
 pub mod lyrics;
 #[cfg(target_os = "macos")]
 pub mod mac_links;

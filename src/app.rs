@@ -304,6 +304,8 @@ pub struct AppOptions {
     /// Read and change the real login registration. Tests and demo runs
     /// leave it alone.
     pub autostart: bool,
+    /// Connect to the Spotifast WebSocket bridge (127.0.0.1:8765/spotifast).
+    pub lucky_bridge: bool,
 }
 
 impl Default for AppOptions {
@@ -313,6 +315,7 @@ impl Default for AppOptions {
             media_controls: true,
             tray: true,
             autostart: true,
+            lucky_bridge: true,
         }
     }
 }
@@ -382,6 +385,13 @@ pub struct App {
     last_settings_save: Instant,
     pub backend: Backend,
     media_controls: Option<MediaControls>,
+    lucky_bridge: Option<crate::lucky_bridge::AppBridgeHandle>,
+    last_seen_bridge_generation: u64,
+    last_sent_track_uri: Option<String>,
+    last_sent_paused: Option<bool>,
+    last_sent_progress_ms: Option<u32>,
+    last_sent_progress_at: Option<Instant>,
+    last_sent_lyrics_uri: Option<String>,
     /// The desktop's light or dark preference, for "Follow system".
     #[cfg(target_os = "linux")]
     pub(crate) system_appearance: Option<crate::appearance::SystemAppearance>,
@@ -1215,6 +1225,14 @@ impl App {
             .unwrap_or(Page::Home);
 
         let palette = settings.fixed_palette().unwrap_or_else(Palette::dark);
+        let lucky_bridge = if options.lucky_bridge {
+            Some(crate::lucky_bridge::start(
+                waker.clone(),
+                backend.lucky_bridge_sender(),
+            ))
+        } else {
+            None
+        };
         let mut app = Self {
             custom_themes: theme::Catalog::default(),
             storage_usage: crate::storage::Usage::default(),
@@ -1231,6 +1249,13 @@ impl App {
             last_settings_save: Instant::now(),
             backend,
             media_controls,
+            lucky_bridge,
+            last_seen_bridge_generation: 0,
+            last_sent_track_uri: None,
+            last_sent_paused: None,
+            last_sent_progress_ms: None,
+            last_sent_progress_at: None,
+            last_sent_lyrics_uri: None,
             #[cfg(target_os = "linux")]
             system_appearance,
             media_art: None,
@@ -5729,6 +5754,200 @@ impl App {
             };
             if let Some(action) = action {
                 self.actions.push(action);
+            }
+        }
+    }
+
+    pub fn dequeue_by_uri(&mut self, uri: &str) -> Result<(), String> {
+        let uri_match = |item_uri: &str| {
+            item_uri == uri
+                || crate::lucky_bridge::extract_uri(item_uri)
+                    .zip(crate::lucky_bridge::extract_uri(uri))
+                    .is_some_and(|(a, b)| a == b)
+        };
+
+        let mut removed_any = false;
+        if let Loadable::Loaded(queue) = &mut self.queue {
+            if let Some(pos) = queue.queue.iter().position(|item| uri_match(item.uri())) {
+                queue.queue.remove(pos);
+                removed_any = true;
+            }
+        }
+        if let Some(pos) = self.manual_queue.iter().position(|q| uri_match(q)) {
+            self.remove_manual_queue_row(pos);
+            removed_any = true;
+        }
+
+        if removed_any {
+            let mut removed = std::collections::HashSet::new();
+            removed.insert(uri.to_string());
+            if let Some((earlier, at)) = self.queue_removed.take()
+                && at.elapsed() < PLAYBACK_HOLD
+            {
+                removed.extend(earlier);
+            }
+            self.queue_removed = Some((removed, Instant::now()));
+            self.resync_local_queue();
+            Ok(())
+        } else {
+            Err(format!("URI not found in queue: {uri}"))
+        }
+    }
+
+    pub fn get_queue_uris(&self) -> Option<Vec<String>> {
+        self.queue
+            .get()
+            .map(|q| q.queue.iter().map(|item| item.uri().to_string()).collect())
+            .or_else(|| Some(self.manual_queue.clone()))
+    }
+
+    fn handle_lucky_bridge(&mut self, _ctx: &egui::Context) {
+        let Some(bridge) = &self.lucky_bridge else {
+            return;
+        };
+
+        let commands = bridge.drain_ui_commands();
+        for command in commands {
+            match command {
+                crate::lucky_bridge::UiCommand::Enqueue { uri, reply } => {
+                    self.queue_one(uri, String::new(), false);
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::Dequeue { uri, reply } => {
+                    let res = self.dequeue_by_uri(&uri).map(|_| serde_json::Value::Bool(true));
+                    let _ = reply.send(res);
+                }
+                crate::lucky_bridge::UiCommand::QueueUris { reply } => {
+                    let uris = self.get_queue_uris();
+                    let val = match uris {
+                        Some(list) => serde_json::to_value(list).unwrap_or(serde_json::Value::Null),
+                        None => serde_json::Value::Null,
+                    };
+                    let _ = reply.send(Ok(val));
+                }
+                crate::lucky_bridge::UiCommand::Skip { reply } => {
+                    self.actions.push(Action::Next);
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::Play { reply } => {
+                    let playing = self.now_playing().is_some_and(|now| now.playing);
+                    if !playing {
+                        self.actions.push(Action::TogglePlay);
+                    }
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::Pause { reply } => {
+                    let playing = self.now_playing().is_some_and(|now| now.playing);
+                    if playing {
+                        self.actions.push(Action::TogglePlay);
+                    }
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::SetVolume { volume, reply } => {
+                    let vol_u8 = (volume * 100.0).round().clamp(0.0, 100.0) as u8;
+                    self.actions.push(Action::SetVolume(vol_u8));
+                    let _ = reply.send(Ok(serde_json::Value::Bool(true)));
+                }
+                crate::lucky_bridge::UiCommand::GetVolume { reply } => {
+                    let vol = self
+                        .now_playing()
+                        .map(|now| now.volume_percent)
+                        .unwrap_or_else(|| volume_to_percent(self.settings.volume));
+                    let _ = reply.send(Ok(serde_json::to_value(vol as f64 / 100.0).unwrap_or(serde_json::Value::Null)));
+                }
+            }
+        }
+    }
+
+    fn sync_lucky_bridge(&mut self) {
+        let (current_gen, event_tx) = match &self.lucky_bridge {
+            Some(bridge) => (bridge.connect_generation(), bridge.event_sender()),
+            None => return,
+        };
+
+        if current_gen != self.last_seen_bridge_generation {
+            self.last_seen_bridge_generation = current_gen;
+            self.last_sent_track_uri = None;
+            self.last_sent_paused = None;
+            self.last_sent_progress_ms = None;
+            self.last_sent_progress_at = None;
+            self.last_sent_lyrics_uri = None;
+        }
+
+        let Some(now) = self.now_playing() else {
+            return;
+        };
+
+        let track_changed = self.last_sent_track_uri.as_deref() != Some(&now.uri);
+        let paused = !now.playing;
+        let paused_changed = self.last_sent_paused != Some(paused);
+
+        if track_changed || paused_changed {
+            self.last_sent_track_uri = Some(now.uri.clone());
+            self.last_sent_paused = Some(paused);
+
+            let artists = now
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let track_data = serde_json::json!({
+                "uri": now.uri,
+                "name": now.title,
+                "artists": artists,
+                "cover": now.art_url,
+                "durationMs": now.duration_ms,
+                "paused": paused,
+                "progressMs": now.position_ms,
+            });
+            let _ = event_tx.send(crate::lucky_bridge::BridgeEvent::Track(track_data));
+
+            if track_changed {
+                self.request_lyrics();
+            }
+        }
+
+        let now_instant = Instant::now();
+        let progress_ms = now.position_ms;
+        let should_send_progress = track_changed
+            || paused_changed
+            || self
+                .last_sent_progress_at
+                .is_none_or(|at| now_instant.duration_since(at) >= Duration::from_millis(1000))
+            || self.last_sent_progress_ms.is_none_or(|last| {
+                if progress_ms < last {
+                    true
+                } else {
+                    progress_ms.saturating_sub(last) > 3000
+                }
+            });
+
+        if should_send_progress {
+            self.last_sent_progress_ms = Some(progress_ms);
+            self.last_sent_progress_at = Some(now_instant);
+            let progress_data = serde_json::json!({
+                "uri": now.uri,
+                "progressMs": progress_ms,
+                "paused": paused,
+            });
+            let _ = event_tx.send(crate::lucky_bridge::BridgeEvent::Progress(progress_data));
+        }
+
+        if self.last_sent_lyrics_uri.as_deref() != Some(&now.uri) {
+            if let Loadable::Loaded(Some(lyrics)) = &self.lyrics {
+                if self.lyrics_uri.as_deref() == Some(&now.uri) {
+                    if let Some(payload) =
+                        crate::lucky_bridge::format_lyrics_for_hub(lyrics, now.duration_ms)
+                    {
+                        self.last_sent_lyrics_uri = Some(now.uri.clone());
+                        let lyrics_data = serde_json::json!({
+                            "uri": now.uri,
+                            "lyrics": payload,
+                        });
+                        let _ = event_tx.send(crate::lucky_bridge::BridgeEvent::Lyrics(lyrics_data));
+                    }
+                }
             }
         }
     }
@@ -14503,6 +14722,7 @@ impl App {
             self.scrolling.stop();
         }
         self.handle_control_commands();
+        self.handle_lucky_bridge(ctx);
         self.handle_events();
         self.open_pending_link();
         self.handle_media_commands();
@@ -14524,6 +14744,7 @@ impl App {
         }
         self.apply_actions(ctx);
         self.sync_media_controls(ctx);
+        self.sync_lucky_bridge();
         self.sync_window_title(ctx);
         self.remember_geometry(ctx);
         #[cfg(target_os = "macos")]

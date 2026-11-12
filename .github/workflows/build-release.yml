@@ -1,0 +1,70 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo & vcpkg
+        uses: Swatinem/rust-cache@v2
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install GLEW via vcpkg
+        run: vcpkg install glew:x64-windows-static
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile Spotifast Release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package Windows Binary and Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/spotifast.exe dist/LuckySpotifast.exe
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/spotifast.exe, README.md, LICENSE -DestinationPath dist/LuckySpotifast-windows-x64.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LuckySpotifast-windows-x64
+          path: |
+            dist/LuckySpotifast.exe
+            dist/LuckySpotifast-windows-x64.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/LuckySpotifast.exe
+            dist/LuckySpotifast-windows-x64.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

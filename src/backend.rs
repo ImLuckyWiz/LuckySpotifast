@@ -703,6 +703,7 @@ pub fn autostart() -> fastframe_autostart::Autostart {
 }
 
 pub enum Command {
+    LuckyBridge(crate::lucky_bridge::CatalogRequest),
     Soloist {
         enabled: bool,
         key: Option<String>,
@@ -1334,6 +1335,10 @@ impl Backend {
     /// Live network activity, for the interface's busy indicator.
     pub fn activity(&self) -> &NetActivity {
         &self.activity
+    }
+
+    pub fn lucky_bridge_sender(&self) -> mpsc::UnboundedSender<Command> {
+        self.commands.clone()
     }
 
     /// Stops Spotify-bound commands from leaving the process; artwork and
@@ -2389,6 +2394,51 @@ impl Worker {
                             result,
                         });
                         waker.wake();
+                    });
+                }
+                Command::LuckyBridge(req) => {
+                    let api = Arc::clone(&self.api);
+                    tokio::spawn(async move {
+                        match req {
+                            crate::lucky_bridge::CatalogRequest::TrackByUri { id, reply } => {
+                                let res = async {
+                                    let client = api
+                                        .client_for(Operation::Catalog)
+                                        .await
+                                        .map_err(|e| format!("{e:?}"))?;
+                                    let track = client
+                                        .track(&id)
+                                        .await
+                                        .map_err(|e| format!("{e:?}"))?;
+                                    Ok(crate::lucky_bridge::SimplifiedTrack::from(&track))
+                                }
+                                .await;
+                                let _ = reply.send(res);
+                            }
+                            crate::lucky_bridge::CatalogRequest::SearchTracks {
+                                query,
+                                limit,
+                                reply,
+                            } => {
+                                let res = crate::lucky_bridge::execute_catalog_search(api, query, limit).await;
+                                let _ = reply.send(res);
+                            }
+                            crate::lucky_bridge::CatalogRequest::ArtistById { id, reply } => {
+                                let res = async {
+                                    let client = api
+                                        .client_for(Operation::Catalog)
+                                        .await
+                                        .map_err(|e| format!("{e:?}"))?;
+                                    let artist = client
+                                        .artist(&id)
+                                        .await
+                                        .map_err(|e| format!("{e:?}"))?;
+                                    Ok((artist.uri, artist.name))
+                                }
+                                .await;
+                                let _ = reply.send(res);
+                            }
+                        }
                     });
                 }
                 Command::Shutdown => break,
