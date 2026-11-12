@@ -5906,7 +5906,7 @@ impl App {
                             items.push(serde_json::json!({
                                 "uri": item.uri(),
                                 "name": item.name(),
-                                "artists": item.artist_names(),
+                                "artists": item.subtitle(),
                             }));
                         }
                     } else {

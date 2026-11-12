@@ -890,7 +890,7 @@ async fn handle_http_connection(
                         send_http_json(&mut stream, 404, "Not Found", &serde_json::json!({ "ok": false, "error": "No se encontraron resultados" })).await;
                     }
                     Err(e) => {
-                        send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await,
+                        send_http_json(&mut stream, 500, "Internal Server Error", &serde_json::json!({ "ok": false, "error": e })).await;
                     }
                 }
             } else {
