@@ -231,6 +231,30 @@ fn failure(error: anyhow::Error) -> ApiError {
     ApiError::Network(error.to_string())
 }
 
+fn lone_track_uri(play: &crate::api::PlayRequest) -> Option<&str> {
+    if play.position_ms != 0 {
+        return None;
+    }
+    if let Some(context) = play.context_uri.as_deref() {
+        if play.uris.is_empty()
+            && play.offset_uri.is_none()
+            && play.offset_position.is_none()
+            && crate::util::uri_kind(context) == Some("track")
+        {
+            return Some(context);
+        }
+        return None;
+    }
+    if let [uri] = play.uris.as_slice()
+        && play.offset_position.is_none_or(|index| index == 0)
+        && play.offset_uri.as_deref().is_none_or(|offset| offset == uri)
+        && crate::util::uri_kind(uri) == Some("track")
+    {
+        return Some(uri);
+    }
+    None
+}
+
 fn commands(request: &ApiRequest) -> Option<Vec<Value>> {
     let ApiRequest::Remote {
         action,
@@ -246,7 +270,10 @@ fn commands(request: &ApiRequest) -> Option<Vec<Value>> {
     };
     let command = match action {
         RemoteAction::Play if play.is_none() => json!({"command":"play"}),
-        RemoteAction::Play => return None, // Preserve context, ordering and selected occurrence.
+        RemoteAction::Play => match play.as_ref().and_then(lone_track_uri) {
+            Some(uri) => json!({"command":"play", "uri": uri}),
+            None => return None, // Preserve context, ordering and selected occurrence.
+        },
         RemoteAction::Pause => json!({"command":"pause"}),
         RemoteAction::Next => json!({"command":"skip_next"}),
         RemoteAction::Previous => json!({"command":"skip_prev"}),
@@ -611,6 +638,35 @@ mod tests {
                 json!({"command":"set_repeat_track","enabled":true})
             ]
         );
+    }
+    #[test]
+    fn lone_track_routes_through_soloist_play_for_autoplay_context() {
+        let mut from_uris = remote(RemoteAction::Play);
+        if let ApiRequest::Remote { play, .. } = &mut from_uris {
+            *play = Some(crate::api::PlayRequest::tracks(vec!["spotify:track:abc".into()]).starting_at_index(0));
+        }
+        assert_eq!(
+            commands(&from_uris).unwrap(),
+            vec![json!({"command":"play", "uri":"spotify:track:abc"})]
+        );
+
+        let mut from_context = remote(RemoteAction::Play);
+        if let ApiRequest::Remote { play, .. } = &mut from_context {
+            *play = Some(crate::api::PlayRequest::context("spotify:track:abc"));
+        }
+        assert_eq!(
+            commands(&from_context).unwrap(),
+            vec![json!({"command":"play", "uri":"spotify:track:abc"})]
+        );
+
+        let mut multi_uris = remote(RemoteAction::Play);
+        if let ApiRequest::Remote { play, .. } = &mut multi_uris {
+            *play = Some(crate::api::PlayRequest::tracks(vec![
+                "spotify:track:a".into(),
+                "spotify:track:b".into(),
+            ]));
+        }
+        assert!(commands(&multi_uris).is_none());
     }
     #[tokio::test]
     async fn a_transfer_during_a_queue_read_leaves_the_new_devices_queue_alone() {
